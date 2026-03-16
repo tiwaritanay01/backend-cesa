@@ -52,6 +52,12 @@ class ApplicationResponse(BaseModel):
     ai_reasoning: Optional[str]
     processing_tier: Optional[str]
     created_at: datetime.datetime
+    vulnerability_score: Optional[int] = 0
+    vulnerability_reasons: Optional[str] = ""
+    matched_schemes: Optional[str] = "[]"
+    fraud_score: Optional[int] = 0
+    fraud_flags: Optional[str] = ""
+    effective_score: Optional[float] = 0.0
 
     model_config = {
         "from_attributes": True
@@ -59,7 +65,49 @@ class ApplicationResponse(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "GovTech AI Agentic Pipeline is running."}
+    return {"message": "GovTech AI Agentic Pipeline is running.", "security": "National Grid Node-7 Active"}
+
+# Global Crisis Flag (In-memory for demo, should be DB in production)
+DISTRICT_CRISIS_MODE = False
+
+@app.post("/api/admin/toggle-crisis")
+def toggle_crisis(status: bool):
+    global DISTRICT_CRISIS_MODE
+    DISTRICT_CRISIS_MODE = status
+    return {"status": "Global Crisis Mode " + ("Active" if status else "Inactive")}
+
+@app.get("/api/admin/system-status")
+def get_system_status():
+    return {
+        "crisis_mode": DISTRICT_CRISIS_MODE,
+        "nodes": ["North-01", "Central-Gov", "AI-Verification-09"],
+        "throughput": "1.2ms/ms"
+    }
+
+# SYSTEM LOGS (In-memory for demo)
+SYSTEM_LOGS = []
+
+def add_system_log(message: str):
+    global SYSTEM_LOGS
+    log = {
+        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+        "message": message
+    }
+    SYSTEM_LOGS.insert(0, log)
+    SYSTEM_LOGS = SYSTEM_LOGS[:10] # Keep last 10
+
+@app.get("/api/system/logs")
+def get_system_logs():
+    return SYSTEM_LOGS
+
+@app.post("/api/process-document")
+async def process_document_endpoint(file: UploadFile = File(...)):
+    """
+    Dedicated OCR endpoint for the frontend.
+    """
+    content = await file.read()
+    ocr_text = ocr_utils.process_document(file.filename, content, api_key=GEMINI_API_KEY)
+    return {"detected_text": ocr_text}
 
 # TIER 1: REGEX VALIDATION LOGIC
 def tier1_regex_check(ocr_text: str):
@@ -130,6 +178,79 @@ def tier2_llm_check(ocr_text: str, user_name: str, expected_doc_type: str):
             return "Verified", f"Local Fallback: name '{user_name}' exists in document.", 2
         else:
             return "Flagged", "Local Fallback: could not find matching name.", 4
+    
+# CORE PS REQUIREMENT: VULNERABILITY & FRAUD ENGINE
+def calculate_vulnerability_and_fraud(ocr_text: str, name: str, db: Session):
+    """
+    Analyzes OCR for economic triggers and cross-checks for anomalies.
+    """
+    v_score = 10
+    v_reasons = []
+    fraud_score = 0
+    fraud_flags = []
+    
+    ocr_lower = ocr_text.lower()
+    
+    # Vulnerability Triggers
+    if any(k in ocr_lower for k in ["bpl", "poverty line", "income certificate"]):
+        v_score += 40
+        v_reasons.append("Economically Vulnerable (BPL Detection)")
+    
+    if any(k in ocr_lower for k in ["farmer", "agricultural", "kisan"]):
+        v_score += 20
+        v_reasons.append("Marginal Sector Participation (Agriculture)")
+
+    if any(k in ocr_lower for k in ["medical", "disability", "health", "hospital"]):
+        v_score += 25
+        v_reasons.append("Health-related Vulnerability Triggered")
+        
+    if DISTRICT_CRISIS_MODE:
+        v_score += 15
+        v_reasons.append("Global District Crisis Modifier Applied (+15)")
+        
+    # Fraud Detection (Duplication Check)
+    import re
+    aadhaar = re.search(r"\d{4}\s\d{4}\s\d{4}", ocr_text)
+    if aadhaar:
+        existing = db.query(models.Application).filter(models.Application.ocr_text.contains(aadhaar.group(0))).first()
+        if existing and existing.name.lower() != name.lower():
+            fraud_score += 60
+            fraud_flags.append("Aadhaar Conflict: ID already linked to another name")
+            
+    if len(ocr_text) < 50:
+        fraud_score += 30
+        fraud_flags.append("Incomplete Data: Minimum OCR threshold not met")
+
+    return min(v_score, 100), ", ".join(v_reasons), fraud_score, ", ".join(fraud_flags)
+
+def match_schemes(v_score: int, ocr_text: str):
+    """
+    Maps citizen profile to available schemes with justification and confidence.
+    """
+    ocr_lower = ocr_text.lower()
+    matched = []
+    
+    # Mock Scheme Library Logic
+    schemes = [
+        {"title": "India Benefit Gold", "threshold": 50, "keywords": ["bpl", "income"], "justification": "Detected Below Poverty Line (BPL) status in verified document."},
+        {"title": "Kisan Credit Shield", "threshold": 30, "keywords": ["farmer", "agricultural"], "justification": "Recognized marginal farming participation through occupational records."},
+        {"title": "Health-Link Subsidy", "threshold": 40, "keywords": ["disability", "health", "medical"], "justification": "Detected medical or disability triggers requiring urgent subsidy support."},
+        {"title": "Universal Basic Aid", "threshold": 10, "keywords": [], "justification": "Qualifies for basic livelihood support program based on residency and vulnerability index."}
+    ]
+    
+    for s in schemes:
+        if v_score >= s["threshold"]:
+            if not s["keywords"] or any(k in ocr_lower for k in s["keywords"]):
+                # Simulate match confidence based on score
+                confidence = min(99, v_score + 15)
+                matched.append({
+                    "title": s["title"],
+                    "confidence": confidence,
+                    "justification": s.get("justification", "Qualified based on eligibility score.")
+                })
+                
+    return matched
+
 
 @app.post("/api/submit_application")
 async def submit_application(
@@ -186,6 +307,12 @@ async def submit_application(
         final_dept = "Police (Home Affairs)"
         prio = 1 # Force high priority for security
     
+    # Calculate Vulnerability and Fraud
+    v_score, v_reasons, f_score, f_flags = calculate_vulnerability_and_fraud(ocr_text, name, db)
+    
+    # Match Schemes
+    matched = match_schemes(v_score, ocr_text)
+    
     db_application = models.Application(
         tracking_id=tracking_id,
         name=name,
@@ -197,22 +324,76 @@ async def submit_application(
         document_name=document_name,
         document_desc=document_desc,
         ocr_text=ocr_text,
-        status=status,
-        is_verified="Verified" if is_v == True or is_v == "Verified" else "Rejected",
-        ai_priority=prio,
+        status="Under Review" if f_score < 50 else "Flagged for Audit",
+        is_verified="Verified" if (is_v == True or is_v == "Verified") and f_score < 50 else ("Rejected" if f_score >= 50 else "Pending"),
+        ai_priority=prio if f_score < 50 else 1, # Boost priority of fraud flags for quick audit
         ai_reasoning=reason,
-        processing_tier=tier
+        processing_tier=tier,
+        vulnerability_score=v_score,
+        vulnerability_reasons=v_reasons,
+        matched_schemes=json.dumps(matched),
+        fraud_score=f_score,
+        fraud_flags=f_flags
     )
     
     db.add(db_application)
     db.commit()
     db.refresh(db_application)
     
+    # LOGGING AI ACTIONS
+    add_system_log(f"New Ingestion: {tracking_id} received.")
+    if "Verified" in db_application.is_verified:
+        add_system_log(f"Gemini verified document for {name}.")
+    else:
+        add_system_log(f"Tier 2 check triggered for {tracking_id}.")
+        
+    if f_score > 0:
+        add_system_log(f"Fraud Guardian: Flagged {tracking_id} (Score: {f_score}).")
+    else:
+        add_system_log(f"Fraud check passed for {name}.")
+
+    if v_score > 60:
+        add_system_log(f"High Vulnerability detected: index {v_score}% for {tracking_id}.")
+
     return {"success": True, "tracking_id": tracking_id, "application": db_application}
 
 @app.get("/api/applications", response_model=List[ApplicationResponse])
 def get_applications(db: Session = Depends(get_db)):
-    return db.query(models.Application).all()
+    # Crisis multiplier check
+    multiplier = 1.5 if DISTRICT_CRISIS_MODE else 1.0
+    apps = db.query(models.Application).all()
+    
+    # Calculate effective score and priority queue logic
+    for app in apps:
+        app.effective_score = app.vulnerability_score * multiplier
+    
+    # Sort by effective score (High to Low), then by Fraud Score (Low to High - basically keep high fraud apps visible at top if scores match)
+    # The requirement says sort return data by (vulnerability_score * crisis_multiplier) DESC
+    sorted_apps = sorted(
+        apps, 
+        key=lambda x: (x.effective_score, -x.fraud_score), 
+        reverse=True
+    )
+    return sorted_apps
+
+@app.get("/api/applications/priority", response_model=List[ApplicationResponse])
+def get_priority_list(db: Session = Depends(get_db)):
+    # Fetch crisis mode from app state or DB
+    multiplier = 1.5 if DISTRICT_CRISIS_MODE else 1.0
+
+    apps = db.query(models.Application).all()
+    
+    # Calculate effective score for sorting without mutating DB
+    for app in apps:
+        app.effective_score = app.vulnerability_score * multiplier
+    
+    # Sort by effective score (High to Low), then by Fraud Score (Low to High)
+    sorted_apps = sorted(
+        apps, 
+        key=lambda x: (x.effective_score, -x.fraud_score), 
+        reverse=True
+    )
+    return sorted_apps
 
 @app.get("/api/applications/{tracking_id}", response_model=ApplicationResponse)
 def get_application(tracking_id: str, db: Session = Depends(get_db)):
