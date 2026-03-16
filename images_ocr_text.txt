@@ -1,0 +1,6 @@
+=== Results for: c:\Users\SACHIN JAISWAR\test_backend\gov-tech-main\WhatsApp Image 2026-03-05 at 11.40.34 AM.jpeg ===
+Error processing image: tesseract is not installed or it's not in your PATH. See README file for more information.
+
+=== Results for: c:\Users\SACHIN JAISWAR\test_backend\gov-tech-main\WhatsApp Image 2026-03-05 at 11.40.42 AM.jpeg ===
+Error processing image: tesseract is not installed or it's not in your PATH. See README file for more information.
+
